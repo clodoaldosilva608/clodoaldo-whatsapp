@@ -113,6 +113,14 @@ async function connectWhatsApp() {
           const fromMe = msg.key.fromMe || false;
           const timestamp = msg.messageTimestamp || Date.now();
 
+          // Só conversas individuais — ignora grupos (@g.us), status e broadcast
+          if (!from.endsWith("@s.whatsapp.net")) continue;
+
+          // Ignora mensagens antigas (fila entregue ao acordar de um sleep)
+          // pra não disparar respostas atrasadas em rajada
+          const tsMs = typeof timestamp === "number" ? timestamp * 1000 : Date.now();
+          if (!fromMe && Date.now() - tsMs > 5 * 60 * 1000) continue;
+
           let text = "";
           if (msg.message.conversation) text = msg.message.conversation;
           else if (msg.message.extendedTextMessage?.text) text = msg.message.extendedTextMessage.text;
@@ -203,6 +211,10 @@ async function disconnectWhatsApp() {
 }
 
 // === ROUTES ===
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "clodoaldo-whatsapp", status: connectionStatus });
+});
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, status: connectionStatus, uptime: process.uptime() });
