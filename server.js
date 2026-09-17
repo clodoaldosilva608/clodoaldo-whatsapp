@@ -16,7 +16,7 @@ const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
 const makeWASocket = require("@whiskeysockets/baileys").default;
-const { DisconnectReason, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const { DisconnectReason, BufferJSON, initAuthCreds, proto } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const fs = require("fs");
 const path = require("path");
@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.3.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.4.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -51,6 +51,145 @@ let connectionStatus = "disconnected";
 let currentQR = null;
 let messagesToday = { count: 0, date: "" };
 const DAILY_LIMIT = 30;
+
+// ============================================================
+// Persistência da SESSÃO (v2.4.0)
+// O auth_state do Baileys (creds.json, session-*.json, pre-key-*.json...)
+// é guardado no site principal (Vercel → banco MEUCORRE, tabela
+// clodoaldo_wa_auth) via /api/whatsapp/auth-state com a MESMA API key do
+// webhook. Assim deploy/restart do Render NÃO desloga o WhatsApp — sem
+// reescanear QR a cada atualização.
+// ============================================================
+const AUTH_SYNC_URL = "https://clodoaldo.vercel.app/api/whatsapp/auth-state";
+
+const authFiles = new Map();      // nome do arquivo → conteúdo (JSON string)
+const authDirty = new Set();      // pendentes de gravação
+const authTombstones = new Set(); // marcados pra REMOÇÃO
+let authFlushTimer = null;
+
+async function authSyncGet() {
+  const resp = await fetch(AUTH_SYNC_URL, { headers: { "x-api-key": API_KEY } });
+  if (!resp.ok) throw new Error(`GET ${resp.status}`);
+  const data = await resp.json();
+  return data.files || {};
+}
+
+async function authSyncPut(files) {
+  const resp = await fetch(AUTH_SYNC_URL, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+    body: JSON.stringify({ files }),
+  });
+  if (!resp.ok) throw new Error(`PUT ${resp.status}`);
+}
+
+async function authSyncClear() {
+  authFiles.clear(); authDirty.clear(); authTombstones.clear();
+  if (authFlushTimer) { clearTimeout(authFlushTimer); authFlushTimer = null; }
+  try {
+    const resp = await fetch(AUTH_SYNC_URL, { method: "DELETE", headers: { "x-api-key": API_KEY } });
+    console.log(`[WA] auth-sync: sessão apagada do banco (HTTP ${resp.status})`);
+  } catch (e) {
+    console.error("[WA] auth-sync: falha ao apagar sessão do banco:", e.message);
+  }
+}
+
+function agendarFlush(ms = 2000) {
+  if (authFlushTimer) return;
+  authFlushTimer = setTimeout(async () => {
+    authFlushTimer = null;
+    await flushAuthNow();
+  }, ms);
+}
+
+async function flushAuthNow() {
+  if (!authDirty.size) return;
+  const batch = {};
+  for (const name of authDirty) {
+    batch[name] = authTombstones.has(name) ? null : authFiles.get(name) ?? null;
+  }
+  authDirty.clear();
+  for (const name of Object.keys(batch)) authTombstones.delete(name);
+  try {
+    await authSyncPut(batch);
+    console.log(`[WA] auth-sync: ${Object.keys(batch).length} arquivo(s) salvos no banco`);
+  } catch (e) {
+    console.error("[WA] auth-sync: PUT falhou (reagendando):", e.message);
+    for (const name of Object.keys(batch)) {
+      if (batch[name] === null) authTombstones.add(name);
+      else authFiles.set(name, batch[name]);
+      authDirty.add(name);
+    }
+    agendarFlush(8000);
+  }
+}
+
+/** Auth state do Baileys apoiado no banco (interface idêntica à useMultiFileAuthState). */
+async function useDbAuthState() {
+  authFiles.clear(); authDirty.clear(); authTombstones.clear();
+  try {
+    const files = await authSyncGet();
+    for (const [name, content] of Object.entries(files)) {
+      if (typeof content === "string") authFiles.set(name, content);
+    }
+    console.log(`[WA] auth-sync: ${authFiles.size} arquivo(s) de sessão carregados do banco`);
+  } catch (e) {
+    console.log(`[WA] auth-sync: sem sessão salva (${e.message}) — segue fluxo do QR`);
+  }
+
+  const readFile = (name) => {
+    const raw = authFiles.get(name);
+    if (raw == null) return null;
+    try { return JSON.parse(raw, BufferJSON.reviver); } catch { return null; }
+  };
+  const writeFile = (name, data) => {
+    authFiles.set(name, JSON.stringify(data, BufferJSON.replacer));
+    authTombstones.delete(name);
+    authDirty.add(name);
+    agendarFlush();
+  };
+  const removeFile = (name) => {
+    if (authFiles.has(name)) authFiles.delete(name);
+    authTombstones.add(name);
+    authDirty.add(name);
+    agendarFlush();
+  };
+
+  const savedCreds = readFile("creds.json");
+  const creds = savedCreds || initAuthCreds();
+  if (savedCreds) console.log("[WA] auth-sync: creds.json encontrada — reconectando SEM QR");
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            let value = readFile(`${type}-${id}.json`);
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[type] = data[type] || {};
+            data[type][id] = value;
+          }
+          return data;
+        },
+        set: async (data) => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const file = `${category}-${id}.json`;
+              if (value) writeFile(file, value);
+              else removeFile(file);
+            }
+          }
+        },
+      },
+    },
+    saveCreds: () => writeFile("creds.json", creds),
+  };
+}
 
 // Create auth dir
 if (!fs.existsSync(AUTH_DIR)) {
@@ -83,7 +222,8 @@ async function connectWhatsApp() {
   connectionStatus = "connecting";
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    // v2.4.0: auth state apoiado no banco — sessão sobrevive a deploy/restart
+    const { state, saveCreds } = await useDbAuthState();
 
     sock = makeWASocket({
       auth: state,
@@ -106,6 +246,8 @@ async function connectWhatsApp() {
       if (connection === "close") {
         currentQR = null;
         connectionStatus = "disconnected";
+        // Salva qualquer key pendente ANTES de perder o socket
+        flushAuthNow().catch(() => {});
         sock = null; // libera o socket morto (permite self-healing)
         const shouldReconnect = (lastDisconnect?.error instanceof Boom)
           ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
@@ -115,11 +257,12 @@ async function connectWhatsApp() {
           console.log("[WA] Connection closed, reconnecting in 3s...");
           setTimeout(() => connectWhatsApp(), 3000);
         } else {
-          console.log("[WA] Logged out, clearing auth and generating a fresh QR in 3s...");
+          console.log("[WA] Logged out, limpando sessão (disco + banco) e gerando QR novo em 3s...");
           if (fs.existsSync(AUTH_DIR)) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             fs.mkdirSync(AUTH_DIR, { recursive: true });
           }
+          authSyncClear(); // v2.4.0: apaga também a sessão do banco
           // Logo após logout já oferece QR novo — sem precisar acessar /qr
           setTimeout(() => connectWhatsApp(), 3000);
         }
@@ -273,6 +416,7 @@ async function disconnectWhatsApp() {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       fs.mkdirSync(AUTH_DIR, { recursive: true });
     }
+    await authSyncClear(); // v2.4.0: sessão também sai do banco
     console.log("[WA] Disconnected and auth cleared");
   }
   return { ok: true };
