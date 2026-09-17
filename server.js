@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.6"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.7"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -82,6 +82,16 @@ const authFiles = new Map();      // nome do arquivo → conteúdo (JSON string)
 const authDirty = new Set();      // pendentes de gravação
 const authTombstones = new Set(); // marcados pra REMOÇÃO
 let authFlushTimer = null;
+
+// v2.5.7: diagnóstico de decrypt — toda pre-key CONSULTADA e AUSENTE no store
+// é registrada aqui. Se um peer cifra com preKeyId que não temos (bundle
+// cacheado de device antigo), a ID exata aparece — fecha o mistério do
+// "Invalid PreKey ID".
+const preKeyMisses = [];
+function registrarPreKeyMiss(id, ts) {
+  preKeyMisses.unshift({ id: String(id), at: new Date(ts || Date.now()).toISOString() });
+  if (preKeyMisses.length > 25) preKeyMisses.pop();
+}
 
 async function authSyncGet() {
   const resp = await fetch(AUTH_SYNC_URL, { headers: { "x-api-key": API_KEY } });
@@ -183,6 +193,10 @@ async function useDbAuthState() {
           const data = {};
           for (const id of ids) {
             let value = readFile(`${type}-${id}.json`);
+            if (type === "pre-key" && value == null) {
+              registrarPreKeyMiss(id);
+              console.log(`[DIAG] pre-key FALTANTE consultada: id=${id} (peer cifrou com pre-key que não existe no store)`);
+            }
             if (type === "app-state-sync-key" && value) {
               value = proto.Message.AppStateSyncKeyData.fromObject(value);
             }
@@ -690,6 +704,7 @@ app.get("/diag", authMiddleware, async (req, res) => {
       },
       lidMappings: { count: lidMappings.length, sample: lidMappings.slice(0, 10) },
       senderKeys: { count: senderKeys.length, sample: senderKeys.slice(0, 5) },
+      preKeyMisses,
       authFilesTotal: authFiles.size,
     });
   } catch (e) {
