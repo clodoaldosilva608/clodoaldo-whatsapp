@@ -26,10 +26,24 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.1.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.2.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://clodoaldo.vercel.app/api/whatsapp/webhook";
-const API_KEY = process.env.WHATSAPP_API_KEY || "clodoaldo-whatsapp-secret-2026";
+// Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
+// dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
+// por env errada). Visíveis em /status pra conferência.
+const WEBHOOK_URL = "https://clodoaldo.vercel.app/api/whatsapp/webhook";
+const API_KEY = "clodoaldo-whatsapp-secret-2026";
+
+// Diagnóstico (v2.2.0): últimas mensagens que o Baileys ENXERGOU — inclusive
+// as ignoradas (do próprio número, grupo, antiga, sem texto). Responde de vez
+// a pergunta "a mensagem chegou ao robô?".
+const lastMessages = [];
+function registrarMsg(info) {
+  const registro = { at: new Date().toISOString(), ...info };
+  lastMessages.unshift(registro);
+  if (lastMessages.length > 10) lastMessages.pop();
+  return registro;
+}
 
 // State
 let sock = null;
@@ -126,22 +140,35 @@ async function connectWhatsApp() {
           const fromMe = msg.key.fromMe || false;
           const timestamp = msg.messageTimestamp || Date.now();
 
-          // Só conversas individuais — ignora grupos (@g.us), status e broadcast
-          if (!from.endsWith("@s.whatsapp.net")) continue;
-
-          // Ignora mensagens antigas (fila entregue ao acordar de um sleep)
-          // pra não disparar respostas atrasadas em rajada
-          const tsMs = typeof timestamp === "number" ? timestamp * 1000 : Date.now();
-          if (!fromMe && Date.now() - tsMs > 5 * 60 * 1000) continue;
-
           let text = "";
           if (msg.message.conversation) text = msg.message.conversation;
           else if (msg.message.extendedTextMessage?.text) text = msg.message.extendedTextMessage.text;
           else if (msg.message.imageMessage?.caption) text = msg.message.imageMessage.caption;
 
-          if (!text) continue;
+          // Motivo de ignorar (registrado pra diagnóstico): grupo/status,
+          // mensagem do próprio número (fromMe — anti-loop), antiga (>5min,
+          // rajada ao acordar) ou sem texto (áudio/sticker/foto sem legenda)
+          let skip = "";
+          if (!from.endsWith("@s.whatsapp.net")) skip = "grupo-ou-status";
+          else if (fromMe) skip = "fromMe-proprio-numero";
+          else {
+            const tsMs = typeof timestamp === "number" ? timestamp * 1000 : Date.now();
+            if (Date.now() - tsMs > 5 * 60 * 1000) skip = "mensagem-antiga";
+          }
+          if (!skip && !text) skip = "sem-texto";
 
           const phone = from.replace(/@s\.whatsapp\.net$/, "").replace(/@g\.us$/, "");
+          const registro = registrarMsg({
+            from: phone,
+            fromMe,
+            text: (text || "(sem texto)").slice(0, 60),
+            skip: skip || "processada",
+          });
+
+          console.log(`[WA] Message ${fromMe ? "sent" : "received"} from ${phone}${skip ? ` [ignorada: ${skip}]` : ""}: ${(text || "(sem texto)").slice(0, 80)}`);
+
+          if (skip) continue;
+
           const messageData = {
             from: phone,
             text,
@@ -149,12 +176,11 @@ async function connectWhatsApp() {
             fromMe,
           };
 
-          console.log(`[WA] Message ${fromMe ? "sent" : "received"} from ${phone}: ${text.slice(0, 80)}`);
-
-          // Forward to main site webhook
-          if (!fromMe) {
+          // Forward to main site webhook (v2.2.0: confere resposta HTTP e tenta 2x)
+          let encaminhado = { ok: false, status: "erro" };
+          for (let tentativa = 1; tentativa <= 2; tentativa++) {
             try {
-              await fetch(WEBHOOK_URL, {
+              const resp = await fetch(WEBHOOK_URL, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
@@ -162,11 +188,18 @@ async function connectWhatsApp() {
                 },
                 body: JSON.stringify(messageData),
               });
-              console.log("[WA] Webhook sent to main site");
+              const corpo = await resp.text().catch(() => "");
+              console.log(`[WA] Webhook resp ${resp.status} (tentativa ${tentativa}): ${corpo.slice(0, 120)}`);
+              encaminhado = { ok: resp.ok, status: resp.status };
+              if (resp.ok || resp.status < 500) break;
             } catch (e) {
-              console.error("[WA] Webhook error:", e.message);
+              console.error(`[WA] Webhook erro (tentativa ${tentativa}):`, e.message);
+              encaminhado = { ok: false, status: "erro-rede" };
             }
+            if (tentativa === 1) await new Promise((r) => setTimeout(r, 1500));
           }
+          registro.encaminhado = encaminhado.ok;
+          registro.respostaWebhook = encaminhado.status;
         }
       } catch (e) {
         console.error("[WA] Message processing error:", e.message);
@@ -312,6 +345,9 @@ app.get("/status", authMiddleware, async (req, res) => {
     qr: qrDataUrl,
     messagesToday: messagesToday.count,
     dailyLimit: DAILY_LIMIT,
+    version: VERSION,
+    webhookUrl: WEBHOOK_URL,
+    lastMessages,
   });
 });
 
@@ -336,7 +372,7 @@ app.post("/send", authMiddleware, async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`[WA] Server running on port ${PORT} (v${VERSION})`);
+  console.log(`[WA] Server running on port ${PORT} (v${VERSION}) | webhook → ${WEBHOOK_URL}`);
   // Auto-connect SEMPRE no boot: com auth reconecta sozinho;
   // sem auth já gera o QR (aparece em /qr e no admin sem ninguém clicar)
   console.log("[WA] Auto-connecting on boot...");
