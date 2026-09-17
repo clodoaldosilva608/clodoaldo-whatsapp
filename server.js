@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.5"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.6"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -632,6 +632,69 @@ app.get("/status", authMiddleware, async (req, res) => {
 app.post("/connect", authMiddleware, async (req, res) => {
   const result = await connectWhatsApp();
   res.json(result);
+});
+
+// GET /diag — diagnóstico criptográfico (v2.5.6). Mostra o estado REAL do
+// Signal no mesmo store usado pelo decrypt: pre-keys locais, pre-keys que o
+// SERVIDOR tem, sessões por-peer, mapeamentos LID e signed pre-key. Fecho
+// diagnóstico dos erros "Invalid PreKey ID" / "No session record".
+app.get("/diag", authMiddleware, async (req, res) => {
+  try {
+    const nomes = [...authFiles.keys()];
+    const preKeyIds = nomes
+      .filter((n) => n.startsWith("pre-key-"))
+      .map((n) => parseInt(n.slice("pre-key-".length), 10))
+      .sort((a, b) => a - b);
+    const sessionJids = nomes
+      .filter((n) => n.startsWith("session-"))
+      .map((n) => n.slice("session-".length, -".json".length));
+    const lidMappings = nomes.filter((n) => n.startsWith("lid-mapping-"));
+    const senderKeys = nomes.filter((n) => n.startsWith("sender-key-"));
+
+    let credsObj = null;
+    try {
+      credsObj = JSON.parse(authFiles.get("creds.json") || "null", BufferJSON.reviver);
+    } catch {}
+
+    // Contagem de pre-keys no servidor do WhatsApp (IQ encrypt/count)
+    let preKeysOnServer = null;
+    if (sock && connectionStatus === "connected") {
+      try {
+        const result = await sock.query({
+          tag: "iq",
+          attrs: { xmlns: "encrypt", type: "get", to: "s.whatsapp.net" },
+          content: [{ tag: "count", attrs: {} }],
+        });
+        const c = (result?.content || []).find((x) => x.tag === "count");
+        preKeysOnServer = c ? +c.attrs.value : null;
+      } catch (e) {
+        preKeysOnServer = `erro: ${e.message}`;
+      }
+    }
+
+    res.json({
+      version: VERSION,
+      status: connectionStatus,
+      me: credsObj?.me || null,
+      nextPreKeyId: credsObj?.nextPreKeyId ?? null,
+      signedPreKeyId: credsObj?.signedPreKey?.keyId ?? null,
+      preKeysLocal: {
+        count: preKeyIds.length,
+        min: preKeyIds[0] ?? null,
+        max: preKeyIds[preKeyIds.length - 1] ?? null,
+      },
+      preKeysOnServer,
+      sessions: {
+        count: sessionJids.length,
+        jids: sessionJids.slice(0, 30),
+      },
+      lidMappings: { count: lidMappings.length, sample: lidMappings.slice(0, 10) },
+      senderKeys: { count: senderKeys.length, sample: senderKeys.slice(0, 5) },
+      authFilesTotal: authFiles.size,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/disconnect", authMiddleware, async (req, res) => {
