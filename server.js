@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.9"; // marcador pra confirmar deploy no Render via /health — v2.5.9: tracking de acks outbound
+const VERSION = "2.6.0"; // marcador pra confirmar deploy no Render via /health — v2.6.0: detector de socket zumbi
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -66,6 +66,33 @@ function registrarOutbound(info) {
   outboundAcks.unshift(registro);
   if (outboundAcks.length > 50) outboundAcks.pop();
   return registro;
+}
+
+// v2.6.0: DETECÇÃO DE SOCKET ZUMBI — a causa raiz dos envios silenciosamente
+// perdidos (lote 16:58 do 17/09: só o 1º de 10 saiu; reenvio 20:49-20:59:
+// 12/12 presos em status=1). Sintoma: o WS está "aberto", o sendMessage
+// resolve SEM erro, mas o servidor WhatsApp nunca manda o ACK — nada chega
+// ao destinatário e o dono não vê nada no próprio aparelho.
+// Regra: mensagem enviada DEVE receber SERVER_ACK (status 2) em segundos.
+// Pendente há mais de ZUMBI_SEG não é "entrega lenta", é socket morto.
+const ZUMBI_SEG = 75;
+function contarPendentesZumbis(minSeg = ZUMBI_SEG) {
+  const corte = Date.now() - minSeg * 1000;
+  return outboundAcks.filter((o) => o.status === 1 && new Date(o.at).getTime() < corte).length;
+}
+function matarZumbi(motivo) {
+  const n = contarPendentesZumbis(30); // marca só os realmente abandonados
+  for (const o of outboundAcks) {
+    if (o.status === 1 && new Date(o.at).getTime() < Date.now() - 30 * 1000) {
+      o.status = 0;
+      o.statusLabel = "erro-zumbi";
+    }
+  }
+  console.log(`[WA] ZUMBI: ${motivo} — matando socket (${n} msgs órfãs marcadas como erro-zumbi)`);
+  if (sock) {
+    try { sock.end(new Error("zumbi: " + motivo)); } catch {}
+    // o handler de connection.update(close) faz sock=null e reconecta em 3s
+  }
 }
 
 // State
@@ -531,6 +558,13 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
   if (!sock || connectionStatus !== "connected") {
     return { ok: false, error: "WhatsApp not connected" };
   }
+  // v2.6.0: recusa enviar em socket zumbi (mensagens anteriores >75s sem ack).
+  // Mata a conexão morta (reconecta em 3s) e NÃO conta no limite diário —
+  // antes, as mensagens órfãs queimavam o dailyLimit sem nunca sair.
+  if (contarPendentesZumbis() >= 2) {
+    matarZumbi("/send recusou em conexão zumbi");
+    return { ok: false, reconectando: true, error: "Socket zumbi detectado (mensagens sem ack do servidor). Reconectando — reenvie em ~40s." };
+  }
 
   const today = new Date().toISOString().slice(0, 10);
   if (messagesToday.date !== today) {
@@ -798,3 +832,15 @@ setInterval(() => {
     connectWhatsApp().catch(() => {});
   }
 }, 60 * 1000);
+
+// v2.6.0: Sweeper de zumbis — a cada 30s, se ≥2 mensagens outbound estão
+// pendentes há >75s, a conexão está morta por dentro. Mata e renasce.
+// Isso cura sozinho o cenário "conectado mas o fio está cortado" — que hoje
+// exige que alguém perceba a falha e reenvie manualmente.
+setInterval(() => {
+  if (shuttingDown) return;
+  if (connectionStatus !== "connected") return;
+  if (contarPendentesZumbis() >= 2) {
+    matarZumbi("sweeper: msgs pendentes >75s sem SERVER_ACK");
+  }
+}, 30 * 1000);
