@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.0.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.1.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://clodoaldo.vercel.app/api/whatsapp/webhook";
 const API_KEY = process.env.WHATSAPP_API_KEY || "clodoaldo-whatsapp-secret-2026";
@@ -42,6 +42,15 @@ const DAILY_LIMIT = 30;
 if (!fs.existsSync(AUTH_DIR)) {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 }
+
+// Resiliência (v2.1.0): um erro do Baileys NUNCA derruba o processo.
+// Reconexões ficam por conta do handler de connection.update.
+process.on("uncaughtException", (err) => {
+  console.error("[WA] uncaughtException (processo mantido vivo):", err?.message || err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[WA] unhandledRejection (processo mantido vivo):", err?.message || err);
+});
 
 // Auth middleware
 function authMiddleware(req, res, next) {
@@ -83,6 +92,7 @@ async function connectWhatsApp() {
       if (connection === "close") {
         currentQR = null;
         connectionStatus = "disconnected";
+        sock = null; // libera o socket morto (permite self-healing)
         const shouldReconnect = (lastDisconnect?.error instanceof Boom)
           ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
           : true;
@@ -91,11 +101,13 @@ async function connectWhatsApp() {
           console.log("[WA] Connection closed, reconnecting in 3s...");
           setTimeout(() => connectWhatsApp(), 3000);
         } else {
-          console.log("[WA] Logged out, clearing auth");
+          console.log("[WA] Logged out, clearing auth and generating a fresh QR in 3s...");
           if (fs.existsSync(AUTH_DIR)) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             fs.mkdirSync(AUTH_DIR, { recursive: true });
           }
+          // Logo após logout já oferece QR novo — sem precisar acessar /qr
+          setTimeout(() => connectWhatsApp(), 3000);
         }
       } else if (connection === "open") {
         currentQR = null;
