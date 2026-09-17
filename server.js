@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.7"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.8"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -189,6 +189,14 @@ async function useDbAuthState() {
     state: {
       creds,
       keys: {
+        // v2.5.8 — FIX DA CAUSA RAIZ: o contrato do Baileys 7 (rc14) exige get()
+        // FLAT ({ [id]: value }) — ver lib/Types/Auth.d.ts e use-multi-file-auth-state.js.
+        // O formato antigo aninhado ({ [type]: { [id]: value } }) fazia o
+        // addTransactionCapability engolir o valor (Object.assign(ctx.cache[type],
+        // fetched) criava chave dupla "pre-key.pre-key") => loadPreKey/loadSession
+        // SEMPRE vazios => "Invalid PreKey ID" / "No session record" para TODO
+        // remetente, com hook de miss calado (a chave existia — só não era lida).
+        // O SET continua aninhado (idem oficial).
         get: async (type, ids) => {
           const data = {};
           for (const id of ids) {
@@ -200,8 +208,7 @@ async function useDbAuthState() {
             if (type === "app-state-sync-key" && value) {
               value = proto.Message.AppStateSyncKeyData.fromObject(value);
             }
-            data[type] = data[type] || {};
-            data[type][id] = value;
+            data[id] = value; // v2.5.8: FLAT (antes: data[type][id] — shape legacy que o rc14 não lê)
           }
           return data;
         },
