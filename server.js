@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.4.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -51,6 +51,8 @@ let connectionStatus = "disconnected";
 let currentQR = null;
 let messagesToday = { count: 0, date: "" };
 const DAILY_LIMIT = 30;
+// v2.5.0: trava contra conexões concorrentes (2 sockets = comportamento errático)
+let isConnecting = false;
 
 // ============================================================
 // Persistência da SESSÃO (v2.4.0)
@@ -218,7 +220,11 @@ async function connectWhatsApp() {
   if (sock && connectionStatus === "connected") {
     return { status: "already_connected" };
   }
+  if (isConnecting) {
+    return { status: "connecting" };
+  }
 
+  isConnecting = true;
   connectionStatus = "connecting";
 
   try {
@@ -249,13 +255,18 @@ async function connectWhatsApp() {
         // Salva qualquer key pendente ANTES de perder o socket
         flushAuthNow().catch(() => {});
         sock = null; // libera o socket morto (permite self-healing)
-        const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-          ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
-          : true;
+        const statusCode = (lastDisconnect?.error instanceof Boom)
+          ? lastDisconnect.error.output.statusCode
+          : null;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        // v2.5.0: log do motivo da queda (diagnóstico de flapping)
+        console.log(
+          `[WA] Connection closed. reason=${statusCode} (${DisconnectReason[statusCode] || "?"}) | reconnect=${shouldReconnect}`
+        );
 
         if (shouldReconnect) {
-          console.log("[WA] Connection closed, reconnecting in 3s...");
-          setTimeout(() => connectWhatsApp(), 3000);
+          setTimeout(() => connectWhatsApp().catch(() => {}), 3000);
         } else {
           console.log("[WA] Logged out, limpando sessão (disco + banco) e gerando QR novo em 3s...");
           if (fs.existsSync(AUTH_DIR)) {
@@ -264,7 +275,7 @@ async function connectWhatsApp() {
           }
           authSyncClear(); // v2.4.0: apaga também a sessão do banco
           // Logo após logout já oferece QR novo — sem precisar acessar /qr
-          setTimeout(() => connectWhatsApp(), 3000);
+          setTimeout(() => connectWhatsApp().catch(() => {}), 3000);
         }
       } else if (connection === "open") {
         currentQR = null;
@@ -365,7 +376,12 @@ async function connectWhatsApp() {
   } catch (e) {
     console.error("[WA] Connection error:", e.message);
     connectionStatus = "disconnected";
+    // v2.5.0: a cadeia de reconexão NUNCA morre — se a tentativa falhar
+    // (ex.: banco indisponível ao carregar a sessão), tenta de novo em 10s.
+    setTimeout(() => connectWhatsApp().catch(() => {}), 10000);
     return { status: "error", error: e.message };
+  } finally {
+    isConnecting = false;
   }
 }
 
@@ -552,3 +568,13 @@ setInterval(async () => {
     console.log("[WA] Keep-alive ping sent");
   } catch {}
 }, 5 * 60 * 1000);
+
+// v2.5.0: Watchdog — rede de segurança da reconexão. A cada 60s, se a conexão
+// não estiver saudável e ninguém estiver conectando, tenta de novo. Garante
+// que NENHUM furo na cadeia de reconexão deixe o robô mudo sem ninguém notar.
+setInterval(() => {
+  if (connectionStatus !== "connected" && !isConnecting) {
+    console.log("[WA] Watchdog: status", connectionStatus, "— tentando reconectar");
+    connectWhatsApp().catch(() => {});
+  }
+}, 60 * 1000);
