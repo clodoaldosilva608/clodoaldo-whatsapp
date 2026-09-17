@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.1"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.2"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -42,6 +42,16 @@ function registrarMsg(info) {
   const registro = { at: new Date().toISOString(), ...info };
   lastMessages.unshift(registro);
   if (lastMessages.length > 10) lastMessages.pop();
+  return registro;
+}
+
+// Diagnóstico (v2.5.2): histórico de eventos de conexão — responde remotamente
+// (sem acesso ao dashboard do Render) o porquê de quedas/flapping.
+const connEvents = [];
+function registrarConn(evento, extra) {
+  const registro = { at: new Date().toISOString(), event: evento, ...(extra || {}) };
+  connEvents.unshift(registro);
+  if (connEvents.length > 15) connEvents.pop();
   return registro;
 }
 
@@ -259,6 +269,7 @@ async function connectWhatsApp() {
       if (qr) {
         currentQR = qr;
         connectionStatus = "qr_ready";
+        registrarConn("qr");
         console.log("[WA] QR Code generated, waiting for scan");
       }
 
@@ -272,6 +283,13 @@ async function connectWhatsApp() {
           ? lastDisconnect.error.output.statusCode
           : null;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        // v2.5.2: motivo da queda vai para o histórico visível em /status
+        registrarConn("close", {
+          reason: statusCode,
+          reasonName: DisconnectReason[statusCode] || "?",
+          erro: lastDisconnect?.error?.message ? String(lastDisconnect.error.message).slice(0, 140) : null,
+        });
 
         // v2.5.0: log do motivo da queda (diagnóstico de flapping)
         console.log(
@@ -293,6 +311,7 @@ async function connectWhatsApp() {
       } else if (connection === "open") {
         currentQR = null;
         connectionStatus = "connected";
+        registrarConn("open");
         console.log("[WA] Connected successfully!");
         // v2.5.1: renova o pool de pre-keys do servidor a cada conexão.
         // O WhatsApp cifra as mensagens de ENTRADA com uma pre-key do nosso
@@ -554,6 +573,7 @@ app.get("/status", authMiddleware, async (req, res) => {
     version: VERSION,
     webhookUrl: WEBHOOK_URL,
     lastMessages,
+    connEvents,
   });
 });
 
