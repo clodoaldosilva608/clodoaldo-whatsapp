@@ -1,0 +1,36 @@
+name: Keep-alive loop
+
+# POR QUE EXISTE: o Render free desliga o serviço após 15 min SEM tráfego HTTP.
+# Com o serviço dormindo, o WhatsApp do robô fica OFFLINE e as mensagens dos
+# leads chegam só no celular (robô não vê, não responde).
+# O cron do GitHub "a cada 5 min" se mostrou NÃO CONFIÁVEL (0 execuções em
+# 5,5h no dia 2026-09-17). Solução: um ÚNICO job de longa duração que faz
+# loop pingando a cada 4 min por 5,5h. Runner público = minutos ilimitados.
+# Limite de duração de job no GitHub: 6h → troca de turno a cada 5h.
+
+on:
+  schedule:
+    - cron: "0 */5 * * *" # inicia um pinger novo a cada 5 horas
+  workflow_dispatch: {} # start manual imediato
+
+concurrency:
+  group: keep-alive-loop
+  cancel-in-progress: true # pinger novo substitui o anterior (handoff limpo)
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330 # 5,5h (margem abaixo do limite de 6h)
+    steps:
+      - name: Ping /health a cada 4 min
+        run: |
+          echo "Pinger iniciado em $(date -u). Loop de 4 min por ~5,5h."
+          fim=$(( $(date +%s) + 325*60 ))
+          while [ $(date +%s) -lt $fim ]; do
+            if curl -fsS -m 45 https://clodoaldo-whatsapp.onrender.com/health; then
+              echo " -> OK $(date -u)"
+            else
+              echo " -> falhou (serviço acordando?) $(date -u)"
+            fi
+            sleep 240
+          done
