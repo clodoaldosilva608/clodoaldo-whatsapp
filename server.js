@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.3"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.4"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -356,7 +356,22 @@ async function connectWhatsApp() {
       try {
         const msgs = m.messages || [];
         for (const msg of msgs) {
-          if (!msg.message) continue;
+          // v2.5.4: mensagens SEM msg.message (stub) são notificações de protocolo
+          // OU mensagens que FALHARAM na descriptografia (LID/sessão/pre-key).
+          // Antes elas eram descartadas ANTES do registro — cegueza total no
+          // diagnóstico ("a msg chegou mas não decifrou" parecia "não chegou").
+          const stubType = msg.messageStubType;
+          const stubParams = (msg.messageStubParameters || []).join(";").slice(0, 90);
+          if (!msg.message) {
+            registrarMsg({
+              from: (msg.key?.remoteJid || "?").replace(/@s\.whatsapp\.net$/, "(j)").replace(/@lid$/, "(lid)"),
+              fromMe: !!msg.key?.fromMe,
+              text: `(stub ${stubType ?? "?"} ${stubParams})`,
+              skip: "stub-sem-conteudo",
+            });
+            console.log(`[WA] Stub message from ${msg.key?.remoteJid} type=${stubType} params=${stubParams}`);
+            continue;
+          }
 
           const from = msg.key.remoteJid || "";
           const fromMe = msg.key.fromMe || false;
@@ -599,6 +614,7 @@ app.get("/status", authMiddleware, async (req, res) => {
     webhookUrl: WEBHOOK_URL,
     lastMessages,
     connEvents,
+    user: sock?.user || null, // v2.5.4: identidade (id/lid/name) como o servidor vê
   });
 });
 
