@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.8"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.9"; // marcador pra confirmar deploy no Render via /health — v2.5.9: tracking de acks outbound
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -52,6 +52,19 @@ function registrarConn(evento, extra) {
   const registro = { at: new Date().toISOString(), event: evento, ...(extra || {}) };
   connEvents.unshift(registro);
   if (connEvents.length > 15) connEvents.pop();
+  return registro;
+}
+
+// v2.5.9: rastreamento de ACKS das mensagens ENVIADAS — fecha o buraco
+// "ok:true não garante entrega". O sendMessage resolve cedo; o status real
+// chega depois via messages.update: 1=pending, 2=servidor aceitou,
+// 3=entregue no aparelho do destinatário, 4=lido, 0=erro.
+const outboundAcks = [];
+const ACK_LABELS = { 0: "erro", 1: "pendente", 2: "servidor-aceitou", 3: "entregue", 4: "lido", 5: "reproduzido" };
+function registrarOutbound(info) {
+  const registro = { at: new Date().toISOString(), statusLabel: ACK_LABELS[info.status] || String(info.status ?? "-"), ...info };
+  outboundAcks.unshift(registro);
+  if (outboundAcks.length > 50) outboundAcks.pop();
   return registro;
 }
 
@@ -487,6 +500,20 @@ async function connectWhatsApp() {
       }
     });
 
+    // v2.5.9: atualiza o status de entrega das mensagens que ENVIAMOS
+    // (ack 2 = servidor WhatsApp aceitou; 3 = entregue no destinatário)
+    esteSock.ev.on("messages.update", (updates) => {
+      if (sock !== esteSock) return;
+      for (const u of updates) {
+        const alvo = outboundAcks.find((o) => o.id === u.key?.id);
+        if (alvo && typeof u.update?.status === "number") {
+          alvo.status = u.update.status;
+          alvo.statusLabel = ACK_LABELS[u.update.status] || String(u.update.status);
+          alvo.ackAt = new Date().toISOString();
+        }
+      }
+    });
+
     return { status: "connecting" };
   } catch (e) {
     console.error("[WA] Connection error:", e.message);
@@ -527,10 +554,17 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
       jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
     }
 
-    await sock.sendMessage(jid, { text });
+    const enviada = await sock.sendMessage(jid, { text });
     messagesToday.count++;
-    console.log(`[WA] Sent to ${jid} (${messagesToday.count}/${DAILY_LIMIT})`);
-    return { ok: true };
+    // v2.5.9: registra para rastrear o ack real (servidor/entrega/leitura)
+    registrarOutbound({
+      id: enviada?.key?.id || "?",
+      to: jid,
+      text: (text || "").slice(0, 40),
+      status: 1,
+    });
+    console.log(`[WA] Sent to ${jid} (${messagesToday.count}/${DAILY_LIMIT}) id=${enviada?.key?.id}`);
+    return { ok: true, id: enviada?.key?.id };
   } catch (e) {
     console.error("[WA] Send error:", e.message);
     return { ok: false, error: e.message };
@@ -646,6 +680,7 @@ app.get("/status", authMiddleware, async (req, res) => {
     webhookUrl: WEBHOOK_URL,
     lastMessages,
     connEvents,
+    outboundAcks, // v2.5.9: status real de entrega das mensagens enviadas
     user: sock?.user || null, // v2.5.4: identidade (id/lid/name) como o servidor vê
   });
 });
