@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.6.0"; // marcador pra confirmar deploy no Render via /health — v2.6.0: detector de socket zumbi
+const VERSION = "2.6.1"; // marcador pra confirmar deploy no Render via /health — v2.6.1: onWhatsApp (JID canônico/LID + validação)
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -588,6 +588,29 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
       jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
     }
 
+    // v2.6.1: resolve o JID CANÔNICO antes de enviar (onWhatsApp = consulta
+    // oficial ao servidor). Motivo: WhatsApp está migrando contas para LID e
+    // JIDs montados à mão (@s.whatsapp.net) podem não ser roteáveis — msg
+    // sai "aceita" localmente mas o servidor nunca acka. Também valida que o
+    // número EXISTE no WhatsApp (lista de leads vem de scraping).
+    if (typeof jidOriginal !== "string" || (!jidOriginal.endsWith("@lid") && !jidOriginal.endsWith("@s.whatsapp.net"))) {
+      try {
+        const digitos = phone.replace(/\D/g, "");
+        const consulta = await sock.onWhatsApp(digitos);
+        const r = Array.isArray(consulta) ? consulta[0] : null;
+        if (!r || !r.exists) {
+          console.log(`[WA] onWhatsApp: ${digitos} NÃO está no WhatsApp`);
+          return { ok: false, erroValidacao: true, error: `Número ${digitos} não está no WhatsApp` };
+        }
+        if (r.jid && r.jid !== jid) {
+          console.log(`[WA] onWhatsApp: ${digitos} -> JID canônico ${r.jid}`);
+        }
+        jid = r.jid || jid;
+      } catch (e) {
+        console.error("[WA] onWhatsApp falhou (seguindo com JID montado):", e.message);
+      }
+    }
+
     const enviada = await sock.sendMessage(jid, { text });
     messagesToday.count++;
     // v2.5.9: registra para rastrear o ack real (servidor/entrega/leitura)
@@ -800,6 +823,30 @@ app.post("/send", authMiddleware, async (req, res) => {
   }
   const result = await sendWhatsAppMessage(phone, text, jid);
   res.json(result);
+});
+
+// v2.6.1: diagnóstico em massa — valida números e devolve o JID canônico de
+// cada um (onWhatsApp). NÃO envia nada. Uso: {phones: ["5581..."]}
+app.post("/onwhatsapp", authMiddleware, async (req, res) => {
+  const { phones } = req.body;
+  if (!Array.isArray(phones) || phones.length === 0) {
+    return res.status(400).json({ ok: false, error: "Missing phones array" });
+  }
+  if (!sock || connectionStatus !== "connected") {
+    return res.json({ ok: false, error: "WhatsApp not connected" });
+  }
+  const results = [];
+  for (const p of phones.slice(0, 30)) {
+    const digitos = String(p).replace(/\D/g, "");
+    try {
+      const consulta = await sock.onWhatsApp(digitos);
+      const r = Array.isArray(consulta) ? consulta[0] : null;
+      results.push({ phone: digitos, exists: r?.exists === true, jid: r?.jid || null });
+    } catch (e) {
+      results.push({ phone: digitos, exists: null, error: e.message });
+    }
+  }
+  res.json({ ok: true, results });
 });
 
 // Start server
