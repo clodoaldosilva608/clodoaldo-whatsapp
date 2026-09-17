@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.1"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -207,6 +207,19 @@ process.on("unhandledRejection", (err) => {
   console.error("[WA] unhandledRejection (processo mantido vivo):", err?.message || err);
 });
 
+// v2.5.1: encerramento GRACIOSO — o Render manda SIGTERM a cada deploy/restart.
+// Sem isso, chaves de sessão geradas nos últimos 2s (janela do flush) morriam
+// com o container e a sessão restaurada no boot seguinte ficava incompleta.
+process.on("SIGTERM", () => {
+  console.log("[WA] SIGTERM recebido — salvando sessão e fechando conexão...");
+  (async () => {
+    try { await flushAuthNow(); } catch {}
+    try { if (sock) sock.end(new Error("deploy-restart")); } catch {}
+    // 1s pro WS mandar o frame de close e o flush terminar
+    setTimeout(() => process.exit(0), 1000);
+  })();
+});
+
 // Auth middleware
 function authMiddleware(req, res, next) {
   const key = req.headers["x-api-key"];
@@ -281,6 +294,17 @@ async function connectWhatsApp() {
         currentQR = null;
         connectionStatus = "connected";
         console.log("[WA] Connected successfully!");
+        // v2.5.1: renova o pool de pre-keys do servidor a cada conexão.
+        // O WhatsApp cifra as mensagens de ENTRADA com uma pre-key do nosso
+        // dispositivo; se o container antigo morreu sem salvar as últimas
+        // (SIGTERM do deploy), a sessão restaurada ficava sem a chave privada
+        // e a mensagem chegava indecifrável (robô mandava, mas não recebia).
+        // Re-carregar garante que só existam no pool chaves que nós temos.
+        if (sock && typeof sock.uploadPreKeys === "function") {
+          sock.uploadPreKeys(50).catch((e) =>
+            console.error("[WA] Renovação de pre-keys falhou:", e.message)
+          );
+        }
       }
     });
 
