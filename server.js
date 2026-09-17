@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.2"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.3"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -63,6 +63,10 @@ let messagesToday = { count: 0, date: "" };
 const DAILY_LIMIT = 30;
 // v2.5.0: trava contra conexões concorrentes (2 sockets = comportamento errático)
 let isConnecting = false;
+// v2.5.3: durante SIGTERM (deploy/restart) nenhuma reconexão deve nascer —
+// um socket fantasma do container antigo rouba a sessão do novo container
+// (440 connectionReplaced)
+let shuttingDown = false;
 
 // ============================================================
 // Persistência da SESSÃO (v2.4.0)
@@ -222,6 +226,7 @@ process.on("unhandledRejection", (err) => {
 // com o container e a sessão restaurada no boot seguinte ficava incompleta.
 process.on("SIGTERM", () => {
   console.log("[WA] SIGTERM recebido — salvando sessão e fechando conexão...");
+  shuttingDown = true; // v2.5.3: congela TODAS as reconexões a partir daqui
   (async () => {
     try { await flushAuthNow(); } catch {}
     try { if (sock) sock.end(new Error("deploy-restart")); } catch {}
@@ -251,19 +256,34 @@ async function connectWhatsApp() {
   connectionStatus = "connecting";
 
   try {
+    // v2.5.3 — CAUSA RAIZ do flapping 440 connectionReplaced: se sobrou um
+    // socket antigo em QUALQUER estado (status != connected passa pela guarda
+    // de cima), ele é encerrado aqui. Dois sockets vivos com a mesma sessão
+    // brigam no servidor do WhatsApp e se substituem em loop infinito.
+    if (sock) {
+      const velho = sock;
+      sock = null; // vira órfão imediatamente: seus handlers viram no-op pelo stale-guard
+      try { velho.end(new Error("substituido-por-nova-conexao")); } catch {}
+    }
+
     // v2.4.0: auth state apoiado no banco — sessão sobrevive a deploy/restart
     const { state, saveCreds } = await useDbAuthState();
 
-    sock = makeWASocket({
+    const esteSock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
       browser: ["Clodoaldo Admin", "Chrome", "1.0.0"],
       defaultQueryTimeoutMs: 60000,
     });
+    sock = esteSock;
 
-    sock.ev.on("creds.update", saveCreds);
+    esteSock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (update) => {
+    esteSock.ev.on("connection.update", (update) => {
+      // v2.5.3: evento de socket órfão (já substituído/anulado) — ignora.
+      // Sem isso o órfão derruba o estado global e agenda reconexões fantasmas.
+      if (sock !== esteSock) return;
+
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -296,7 +316,11 @@ async function connectWhatsApp() {
           `[WA] Connection closed. reason=${statusCode} (${DisconnectReason[statusCode] || "?"}) | reconnect=${shouldReconnect}`
         );
 
-        if (shouldReconnect) {
+        if (shuttingDown) {
+          // v2.5.3: container morrendo (deploy) — reconexão congelada, o novo
+          // container assume a sessão. Reconectar aqui geraria socket fantasma.
+          console.log("[WA] Close durante shutdown — reconexão congelada");
+        } else if (shouldReconnect) {
           setTimeout(() => connectWhatsApp().catch(() => {}), 3000);
         } else {
           console.log("[WA] Logged out, limpando sessão (disco + banco) e gerando QR novo em 3s...");
@@ -327,7 +351,8 @@ async function connectWhatsApp() {
       }
     });
 
-    sock.ev.on("messages.upsert", async (m) => {
+    esteSock.ev.on("messages.upsert", async (m) => {
+      if (sock !== esteSock) return; // v2.5.3: socket órfão não processa mensagens
       try {
         const msgs = m.messages || [];
         for (const msg of msgs) {
@@ -617,6 +642,10 @@ setInterval(async () => {
 // não estiver saudável e ninguém estiver conectando, tenta de novo. Garante
 // que NENHUM furo na cadeia de reconexão deixe o robô mudo sem ninguém notar.
 setInterval(() => {
+  if (shuttingDown) return; // v2.5.3: nada de reconexão durante shutdown
+  // v2.5.3: em qr_ready existe um socket VIVO aguardando o scan — o watchdog
+  // não pode substituí-lo (invalidava o QR a cada 60s durante o scan)
+  if (connectionStatus === "qr_ready") return;
   if (connectionStatus !== "connected" && !isConnecting) {
     console.log("[WA] Watchdog: status", connectionStatus, "— tentando reconectar");
     connectWhatsApp().catch(() => {});
