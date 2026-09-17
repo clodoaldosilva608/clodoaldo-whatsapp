@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.2.0"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.3.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -147,9 +147,17 @@ async function connectWhatsApp() {
 
           // Motivo de ignorar (registrado pra diagnóstico): grupo/status,
           // mensagem do próprio número (fromMe — anti-loop), antiga (>5min,
-          // rajada ao acordar) ou sem texto (áudio/sticker/foto sem legenda)
+          // rajada ao acordar) ou sem texto (áudio/sticker/foto sem legenda).
+          // v2.3.0: JIDs @lid (usuário REAL com privacidade ativada — comum em
+          // quem clica em anúncio) NÃO são mais descartados. Só descartamos
+          // grupos (@g.us), status/broadcast e canais (@newsletter).
           let skip = "";
-          if (!from.endsWith("@s.whatsapp.net")) skip = "grupo-ou-status";
+          const ehGrupo = from.endsWith("@g.us");
+          const ehStatus =
+            from === "status@broadcast" ||
+            from.endsWith("@broadcast") ||
+            from.endsWith("@newsletter");
+          if (ehGrupo || ehStatus) skip = "grupo-ou-status";
           else if (fromMe) skip = "fromMe-proprio-numero";
           else {
             const tsMs = typeof timestamp === "number" ? timestamp * 1000 : Date.now();
@@ -157,20 +165,24 @@ async function connectWhatsApp() {
           }
           if (!skip && !text) skip = "sem-texto";
 
-          const phone = from.replace(/@s\.whatsapp\.net$/, "").replace(/@g\.us$/, "");
+          const phone = from
+            .replace(/@s\.whatsapp\.net$/, "")
+            .replace(/@g\.us$/, "")
+            .replace(/@lid$/, "");
           const registro = registrarMsg({
-            from: phone,
+            from: from.endsWith("@lid") ? `${phone} (lid)` : phone,
             fromMe,
             text: (text || "(sem texto)").slice(0, 60),
             skip: skip || "processada",
           });
 
-          console.log(`[WA] Message ${fromMe ? "sent" : "received"} from ${phone}${skip ? ` [ignorada: ${skip}]` : ""}: ${(text || "(sem texto)").slice(0, 80)}`);
+          console.log(`[WA] Message ${fromMe ? "sent" : "received"} from ${phone}${from.endsWith("@lid") ? " [LID]" : ""}${skip ? ` [ignorada: ${skip}]` : ""}: ${(text || "(sem texto)").slice(0, 80)}`);
 
           if (skip) continue;
 
           const messageData = {
             from: phone,
+            jid: from, // v2.3.0: JID original preservado (resposta p/ @lid)
             text,
             timestamp: typeof timestamp === "number" ? timestamp * 1000 : Date.now(),
             fromMe,
@@ -214,7 +226,7 @@ async function connectWhatsApp() {
   }
 }
 
-async function sendWhatsAppMessage(phone, text) {
+async function sendWhatsAppMessage(phone, text, jidOriginal) {
   if (!sock || connectionStatus !== "connected") {
     return { ok: false, error: "WhatsApp not connected" };
   }
@@ -228,12 +240,22 @@ async function sendWhatsAppMessage(phone, text) {
   }
 
   try {
-    let jid = phone.replace(/\D/g, "");
-    if (!jid.endsWith("@s.whatsapp.net")) jid += "@s.whatsapp.net";
+    // v2.3.0: se veio o JID original da conversa (@lid ou @s.whatsapp.net),
+    // usamos ele direto — é a forma correta de responder a usuários com
+    // privacidade ativada (LID). Sem JID válido, monta a partir dos dígitos.
+    let jid;
+    if (
+      typeof jidOriginal === "string" &&
+      (jidOriginal.endsWith("@lid") || jidOriginal.endsWith("@s.whatsapp.net"))
+    ) {
+      jid = jidOriginal;
+    } else {
+      jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
+    }
 
     await sock.sendMessage(jid, { text });
     messagesToday.count++;
-    console.log(`[WA] Sent to ${phone} (${messagesToday.count}/${DAILY_LIMIT})`);
+    console.log(`[WA] Sent to ${jid} (${messagesToday.count}/${DAILY_LIMIT})`);
     return { ok: true };
   } catch (e) {
     console.error("[WA] Send error:", e.message);
@@ -362,11 +384,11 @@ app.post("/disconnect", authMiddleware, async (req, res) => {
 });
 
 app.post("/send", authMiddleware, async (req, res) => {
-  const { phone, text } = req.body;
+  const { phone, text, jid } = req.body;
   if (!phone || !text) {
     return res.status(400).json({ ok: false, error: "Missing phone or text" });
   }
-  const result = await sendWhatsAppMessage(phone, text);
+  const result = await sendWhatsAppMessage(phone, text, jid);
   res.json(result);
 });
 
