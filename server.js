@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.5.4"; // marcador pra confirmar deploy no Render via /health
+const VERSION = "2.5.5"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -344,9 +344,20 @@ async function connectWhatsApp() {
         // e a mensagem chegava indecifrável (robô mandava, mas não recebia).
         // Re-carregar garante que só existam no pool chaves que nós temos.
         if (sock && typeof sock.uploadPreKeys === "function") {
-          sock.uploadPreKeys(50).catch((e) =>
-            console.error("[WA] Renovação de pre-keys falhou:", e.message)
-          );
+          sock.uploadPreKeys(50)
+            .then(async () => {
+              // v2.5.5: pre-keys novas vão pro banco IMEDIATAMENTE (sem esperar
+              // o flush de 2s). Se o container morrer no handoff de um deploy,
+              // as chaves privadas já estão persistidas — a sessão restaurada
+              // decifra as mensagens. (Causa raiz dos erros "Invalid PreKey
+              // ID" / "No session record" de 17/09: uploads concorrentes de
+              // containers com blobs divergentes durante o flapping 440.)
+              try { await flushAuthNow(); } catch {}
+              console.log("[WA] Pool de pre-keys renovado e JÁ PERSISTIDO no banco");
+            })
+            .catch((e) =>
+              console.error("[WA] Renovação de pre-keys falhou:", e.message)
+            );
         }
       }
     });
