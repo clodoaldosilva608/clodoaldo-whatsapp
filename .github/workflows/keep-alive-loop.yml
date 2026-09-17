@@ -3,29 +3,39 @@ name: Keep-alive loop
 # POR QUE EXISTE: o Render free desliga o serviço após 15 min SEM tráfego HTTP.
 # Com o serviço dormindo, o WhatsApp do robô fica OFFLINE e as mensagens dos
 # leads chegam só no celular (robô não vê, não responde).
-# O cron do GitHub "a cada 5 min" se mostrou NÃO CONFIÁVEL (0 execuções em
-# 5,5h no dia 2026-09-17). Solução: um ÚNICO job de longa duração que faz
-# loop pingando a cada 4 min por 5,5h. Runner público = minutos ilimitados.
-# Limite de duração de job no GitHub: 6h → troca de turno a cada 5h.
+#
+# HISTÓRICO DAS FALHAS (por que este design):
+# 1. cron */5 min → 0 execuções em 5,5h (o scheduler do GitHub só avaliou os
+#    crons após pushes; em dia sem atividade ele NÃO dispara sozinho).
+# 2. Job de 5,5h com cron 0 */5 → a cadeia quebraria no primeiro dia sem push.
+#
+# DESIGN ATUAL (auto-perpetuante): o job pinga por ~4h50 e, no fim, DISPARA
+# ele mesmo de novo via workflow_dispatch (GITHUB_TOKEN tem permissão e
+# workflow_dispatch/repository_dispatch SÃO exceções permitidas — não contam
+# como evento recursivo). O cron permanece só como rede de segurança extra
+# (re-semeia a cadeia após qualquer push).
 
 on:
   schedule:
-    - cron: "0 */5 * * *" # inicia um pinger novo a cada 5 horas
+    - cron: "0 */5 * * *" # rede de segurança (dispara após pushes, no mínimo)
   workflow_dispatch: {} # start manual imediato
+
+permissions:
+  actions: write # necessário para o job disparar o próximo turno
 
 concurrency:
   group: keep-alive-loop
-  cancel-in-progress: true # pinger novo substitui o anterior (handoff limpo)
+  cancel-in-progress: true # turno novo substitui o anterior (handoff limpo)
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 330 # 5,5h (margem abaixo do limite de 6h)
+    timeout-minutes: 320 # rede de segurança acima do loop de 290 min
     steps:
-      - name: Ping /health a cada 4 min
+      - name: Ping /health a cada 4 min (~4h50)
         run: |
-          echo "Pinger iniciado em $(date -u). Loop de 4 min por ~5,5h."
-          fim=$(( $(date +%s) + 325*60 ))
+          echo "Pinger iniciado em $(date -u). Loop de 4 min por ~4h50."
+          fim=$(( $(date +%s) + 290*60 ))
           while [ $(date +%s) -lt $fim ]; do
             if curl -fsS -m 45 https://clodoaldo-whatsapp.onrender.com/health; then
               echo " -> OK $(date -u)"
@@ -34,3 +44,13 @@ jobs:
             fi
             sleep 240
           done
+
+      - name: Dispara o próximo turno (auto-perpetuação)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/actions/workflows/keep-alive-loop.yml/dispatches" \
+            -f ref="${{ github.ref_name }}" \
+          && echo "✅ próximo turno agendado em $(date -u)"
