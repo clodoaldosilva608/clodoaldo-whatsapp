@@ -1,0 +1,25 @@
+# Keep-alive: pinga o serviço no Render a cada 5 minutos pra ele nunca dormir.
+# IMPORTANTE: no plano free do Render o disco é efêmero — se o serviço dormir,
+# o auth_state é apagado e o QR precisa ser escaneado de novo. Este workflow
+# evita isso mantendo o serviço sempre acordado.
+#
+# Obs: o GitHub desativa workflows agendados após 60 dias sem commits no repo.
+# Se parar de rodar, reative em https://github.com/clodoaldosilva608/clodoaldo-whatsapp/actions
+name: Keep-alive ping
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 120 https://clodoaldo-whatsapp.onrender.com/health || echo "000")
+          echo "Health HTTP: $CODE"
+          test "$CODE" = "200"

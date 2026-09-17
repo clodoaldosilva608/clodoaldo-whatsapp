@@ -26,6 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
+const VERSION = "2.0.0"; // marcador pra confirmar deploy no Render via /health
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://clodoaldo.vercel.app/api/whatsapp/webhook";
 const API_KEY = process.env.WHATSAPP_API_KEY || "clodoaldo-whatsapp-secret-2026";
@@ -213,11 +214,72 @@ async function disconnectWhatsApp() {
 // === ROUTES ===
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "clodoaldo-whatsapp", status: connectionStatus });
+  res.json({ ok: true, service: "clodoaldo-whatsapp", version: VERSION, status: connectionStatus });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, status: connectionStatus, uptime: process.uptime() });
+  res.json({ ok: true, version: VERSION, status: connectionStatus, uptime: process.uptime() });
+});
+
+// Página amigável pra escanear o QR no navegador (sem login, protegida pela key)
+app.get("/qr", async (req, res) => {
+  const key = String(req.query.key || "");
+  if (key !== API_KEY) {
+    return res.status(401).send(
+      "<h1 style='font-family:sans-serif'>401 — Chave inválida</h1>" +
+      "<p style='font-family:sans-serif'>Use o link completo com ?key=...</p>"
+    );
+  }
+
+  // Self-healing: se caiu por logout, religa pra gerar QR novo
+  if (connectionStatus === "disconnected" && !sock) {
+    connectWhatsApp();
+  }
+
+  let qrImg = null;
+  if (currentQR) {
+    try {
+      qrImg = await QRCode.toDataURL(currentQR, { width: 320, margin: 2 });
+    } catch {}
+  }
+
+  const refresh = connectionStatus === "connected" ? "" : '<meta http-equiv="refresh" content="5">';
+
+  let corpo = "";
+  if (connectionStatus === "connected") {
+    corpo = `
+      <div style="background:#dcfce7;border:1px solid #86efac;color:#166534;padding:24px 32px;border-radius:16px;text-align:center">
+        <h1 style="margin:0 0 8px">✅ WhatsApp conectado!</h1>
+        <p style="margin:0">Tudo certo — pode fechar esta página. O bot responde sozinho pelo menu automático.</p>
+      </div>`;
+  } else if (qrImg) {
+    corpo = `
+      <h2 style="color:#111">Escaneie este QR Code</h2>
+      <img src="${qrImg}" alt="QR Code WhatsApp" width="320" height="320" style="border-radius:12px;border:1px solid #e5e5e5" />
+      <ol style="text-align:left;max-width:340px;margin:16px auto;color:#444;line-height:1.6">
+        <li>Abra o <strong>WhatsApp</strong> no seu celular</li>
+        <li>Toque em <strong>Configurações → Dispositivos conectados</strong></li>
+        <li>Toque em <strong>Conectar dispositivo</strong></li>
+        <li>Aponte a câmera pra este QR</li>
+      </ol>
+      <p style="color:#888;font-size:13px">A página atualiza sozinha a cada 5s. Se o QR expirar, um novo aparece aqui.</p>`;
+  } else {
+    corpo = `
+      <h2 style="color:#111">Gerando QR Code…</h2>
+      <p style="color:#666">Aguarde alguns segundos — a página atualiza sozinha.</p>
+      <p style="color:#aaa;font-size:13px">Status atual: ${connectionStatus}</p>`;
+  }
+
+  res.send(`<!doctype html>
+<html lang="pt-BR"><head>
+  <meta charset="utf-8">
+  ${refresh}
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsApp — Conexão</title>
+</head>
+<body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#fafafa;margin:0;padding:32px 16px;text-align:center">
+  ${corpo}
+</body></html>`);
 });
 
 app.get("/status", authMiddleware, async (req, res) => {
@@ -262,15 +324,11 @@ app.post("/send", authMiddleware, async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`[WA] Server running on port ${PORT}`);
-  // Auto-connect if auth exists
-  const authFiles = fs.existsSync(AUTH_DIR) ? fs.readdirSync(AUTH_DIR) : [];
-  if (authFiles.length > 0) {
-    console.log("[WA] Auth files found, auto-connecting...");
-    connectWhatsApp();
-  } else {
-    console.log("[WA] No auth files, waiting for /connect");
-  }
+  console.log(`[WA] Server running on port ${PORT} (v${VERSION})`);
+  // Auto-connect SEMPRE no boot: com auth reconecta sozinho;
+  // sem auth já gera o QR (aparece em /qr e no admin sem ninguém clicar)
+  console.log("[WA] Auto-connecting on boot...");
+  connectWhatsApp();
 });
 
 // Keep-alive: ping self every 5 minutes to prevent Render free tier sleep
