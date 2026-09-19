@@ -21,7 +21,20 @@ Serviço gratuito que mantém conexão WhatsApp 24/7 via Baileys (deployado no R
 - `GET /status` (header `x-api-key`) — status + QR como data URL
 - `POST /connect` (auth) — iniciar conexão
 - `POST /disconnect` (auth) — desconectar e limpar auth
-- `POST /send` (auth) — enviar mensagem `{ phone, text }` (limite 30/dia)
+- `POST /send` (auth) — enviar mensagem `{ phone, text }` (limite **10/dia** de envios frios — plano seguro; `{ resposta: true }` = reply do menu, cota separada de 150/dia)
+- `POST /onwhatsapp` (auth) — valida números e devolve JID canônico (não envia nada)
+
+## Plano seguro (v2.7.0) — prospecção automática
+
+O bot roda um **pacer** interno: a cada ciclo ele PUXA 1 item da fila de
+prospecção do site (`/api/whatsapp/pull`) e envia respeitando:
+
+- **Teto de 10 envios frios/dia** (compartilhado com o `/send` manual)
+- **Intervalo de 10-13 min** entre cada envio (sorteado — nunca rajada)
+- **Janela humana 09:00-19:00 BRT** (nenhum envio de madrugada/noite)
+- A Vercel valida pausado / modo auto / limite / intervalo e entrega o item;
+  o bot reporta o desfecho de volta (enviado / erro / retentar)
+- Estado do pacer visível em `GET /status` (campo `pacer`)
 
 ## Configuração (Render)
 

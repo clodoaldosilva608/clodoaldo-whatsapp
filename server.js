@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.6.1"; // marcador pra confirmar deploy no Render via /health — v2.6.1: onWhatsApp (JID canônico/LID + validação)
+const VERSION = "2.7.0"; // marcador pra confirmar deploy no Render via /health — v2.7.0: plano seguro (pacer 10/dia, intervalo 10-13min, janela 9-19h BRT)
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -99,8 +99,14 @@ function matarZumbi(motivo) {
 let sock = null;
 let connectionStatus = "disconnected";
 let currentQR = null;
+// v2.7.0 (PLANO SEGURO): cota FRIA (prospecção — envios iniciados por nós).
+// Teto 10/dia. Respostas do menu automático (flag resposta:true) têm cota
+// SEPARADA — são reply a mensagem recebida, risco mínimo, e não podem
+// competir com a prospecção nem ser bloqueadas por ela.
 let messagesToday = { count: 0, date: "" };
-const DAILY_LIMIT = 30;
+const DAILY_LIMIT = 10;
+let repliesToday = { count: 0, date: "" };
+const REPLY_DAILY_LIMIT = 150;
 // v2.5.0: trava contra conexões concorrentes (2 sockets = comportamento errático)
 let isConnecting = false;
 // v2.5.3: durante SIGTERM (deploy/restart) nenhuma reconexão deve nascer —
@@ -554,7 +560,8 @@ async function connectWhatsApp() {
   }
 }
 
-async function sendWhatsAppMessage(phone, text, jidOriginal) {
+async function sendWhatsAppMessage(phone, text, jidOriginal, opts = {}) {
+  const ehResposta = opts.resposta === true; // menu automático / reply a recebida
   if (!sock || connectionStatus !== "connected") {
     return { ok: false, error: "WhatsApp not connected" };
   }
@@ -567,11 +574,19 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  if (messagesToday.date !== today) {
-    messagesToday = { count: 0, date: today };
-  }
-  if (messagesToday.count >= DAILY_LIMIT) {
-    return { ok: false, error: `Daily limit of ${DAILY_LIMIT} messages reached` };
+  // v2.7.0: contadores por tipo (fria x resposta), cada um com o próprio teto
+  if (ehResposta) {
+    if (repliesToday.date !== today) repliesToday = { count: 0, date: today };
+    if (repliesToday.count >= REPLY_DAILY_LIMIT) {
+      return { ok: false, error: `Daily reply limit of ${REPLY_DAILY_LIMIT} reached` };
+    }
+  } else {
+    if (messagesToday.date !== today) {
+      messagesToday = { count: 0, date: today };
+    }
+    if (messagesToday.count >= DAILY_LIMIT) {
+      return { ok: false, limiteDiario: true, error: `Daily limit of ${DAILY_LIMIT} cold messages reached (plano seguro)` };
+    }
   }
 
   try {
@@ -612,7 +627,8 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
     }
 
     const enviada = await sock.sendMessage(jid, { text });
-    messagesToday.count++;
+    // v2.7.0: incrementa o contador do tipo correto (fria x resposta)
+    if (ehResposta) repliesToday.count++; else messagesToday.count++;
     // v2.5.9: registra para rastrear o ack real (servidor/entrega/leitura)
     registrarOutbound({
       id: enviada?.key?.id || "?",
@@ -620,7 +636,7 @@ async function sendWhatsAppMessage(phone, text, jidOriginal) {
       text: (text || "").slice(0, 40),
       status: 1,
     });
-    console.log(`[WA] Sent to ${jid} (${messagesToday.count}/${DAILY_LIMIT}) id=${enviada?.key?.id}`);
+    console.log(`[WA] Sent to ${jid} (${ehResposta ? `reply ${repliesToday.count}/${REPLY_DAILY_LIMIT}` : `fria ${messagesToday.count}/${DAILY_LIMIT}`}) id=${enviada?.key?.id}`);
     return { ok: true, id: enviada?.key?.id };
   } catch (e) {
     console.error("[WA] Send error:", e.message);
@@ -733,8 +749,11 @@ app.get("/status", authMiddleware, async (req, res) => {
     qr: qrDataUrl,
     messagesToday: messagesToday.count,
     dailyLimit: DAILY_LIMIT,
+    repliesToday: repliesToday.date === new Date().toISOString().slice(0, 10) ? repliesToday.count : 0,
+    replyDailyLimit: REPLY_DAILY_LIMIT,
     version: VERSION,
     webhookUrl: WEBHOOK_URL,
+    pacer: pacerStatus(), // v2.7.0: estado do plano seguro
     lastMessages,
     connEvents,
     outboundAcks, // v2.5.9: status real de entrega das mensagens enviadas
@@ -817,13 +836,115 @@ app.post("/disconnect", authMiddleware, async (req, res) => {
 });
 
 app.post("/send", authMiddleware, async (req, res) => {
-  const { phone, text, jid } = req.body;
+  const { phone, text, jid, resposta } = req.body;
   if (!phone || !text) {
     return res.status(400).json({ ok: false, error: "Missing phone or text" });
   }
-  const result = await sendWhatsAppMessage(phone, text, jid);
+  // v2.7.0: resposta=true → reply do menu automático (cota separada da fria)
+  const result = await sendWhatsAppMessage(phone, text, jid, { resposta: resposta === true });
   res.json(result);
 });
+
+// ============================================================
+// v2.7.0 — PACER: envio automático de prospecção em PLANO SEGURO
+//
+// Antes: o cron do Vercel empurrava a fila em rajada (2,5s entre msgs) —
+// comportamento de bot, território de ban. Agora o ritmo é ditado AQUI,
+// no processo sempre ligado, que PUXA 1 item por vez do site:
+//   - Máximo 10 envios frios/dia (mesma cota do /send manual)
+//   - Intervalo de 10-13 min (sorteado) entre cada envio
+//   - Só envia dentro da janela humana 09:00-19:00 BRT
+//   - A Vercel (/api/whatsapp/pull) valida pausado/auto_send/limite/gap e
+//     entrega 1 item com claim atômico; o bot reporta o desfecho de volta
+//   - Textos já vão variados da fila (rotação A/B/A/C por nicho)
+// ============================================================
+const APP_BASE = WEBHOOK_URL.replace(/\/api\/whatsapp\/webhook$/, "");
+const PACER = {
+  intervaloMin: 12,   // re-sorteado (10-13) após cada envio
+  ultimoEnvioMs: 0,   // início do relógio do intervalo
+  enviados: 0,        // enviados pelo pacer hoje (informativo)
+  rodando: false,
+  ultimoMotivo: "iniciando",
+  ultimaTentativa: null,
+};
+
+function pacerStatus() {
+  const faltaMs = PACER.ultimoEnvioMs
+    ? PACER.ultimoEnvioMs + PACER.intervaloMin * 60_000 - Date.now()
+    : 0;
+  return {
+    ativo: true,
+    intervalo_min: PACER.intervaloMin,
+    janela_brt: "09:00-19:00",
+    limite_frias_dia: DAILY_LIMIT,
+    frias_hoje: messagesToday.date === new Date().toISOString().slice(0, 10) ? messagesToday.count : 0,
+    proximo_envio_em_min: faltaMs > 0 ? Math.ceil(faltaMs / 60_000) : 0,
+    enviados_hoje: PACER.enviados,
+    ultimo_motivo: PACER.ultimoMotivo,
+    ultima_tentativa: PACER.ultimaTentativa,
+  };
+}
+
+function horaBRT() {
+  return new Date(Date.now() - 3 * 3600 * 1000).getUTCHours();
+}
+
+async function pacerCiclo() {
+  if (shuttingDown || PACER.rodando) return;
+  if (connectionStatus !== "connected") { PACER.ultimoMotivo = "desconectado"; return; }
+  const h = horaBRT();
+  if (h < 9 || h >= 19) { PACER.ultimoMotivo = `fora-da-janela (${h}h BRT)`; return; }
+  const hoje = new Date().toISOString().slice(0, 10);
+  if (messagesToday.date === hoje && messagesToday.count >= DAILY_LIMIT) { PACER.ultimoMotivo = "limite-diario"; return; }
+  if (Date.now() - PACER.ultimoEnvioMs < PACER.intervaloMin * 60 * 1000) { PACER.ultimoMotivo = "intervalo"; return; }
+
+  PACER.rodando = true;
+  try {
+    PACER.ultimaTentativa = new Date().toISOString();
+    // CLAIM — pede 1 item ao site (Vercel valida pausado/auto_send/limite/gap)
+    const r = await fetch(APP_BASE + "/api/whatsapp/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ action: "claim" }),
+    });
+    const data = await r.json().catch(() => null);
+    if (!data || !data.item) {
+      PACER.ultimoMotivo = data?.motivo ? `sem-item: ${data.motivo}` : "sem-item";
+      PACER.ultimoEnvioMs = Date.now(); // não martela: próxima tentativa após o intervalo
+      return;
+    }
+
+    const { ref_id, telefone, mensagem, nome } = data.item;
+    console.log(`[PACER] Enviando para ${nome || telefone} (fria ${messagesToday.count + 1}/${DAILY_LIMIT} hoje, próxima em ~${PACER.intervaloMin}min)`);
+    const res = await sendWhatsAppMessage(telefone, mensagem);
+    PACER.ultimoEnvioMs = Date.now();
+    PACER.intervaloMin = 10 + Math.floor(Math.random() * 4); // próximo gap: 10-13 min
+    if (res.ok) PACER.enviados++;
+    PACER.ultimoMotivo = res.ok ? "enviou" : `falhou: ${res.error || "?"}`;
+
+    // RESULT — reporta o desfecho pra fila marcar enviado/erro/retry
+    try {
+      await fetch(APP_BASE + "/api/whatsapp/pull", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+        body: JSON.stringify({
+          action: "result", ref_id,
+          ok: res.ok === true,
+          error: res.error, erroValidacao: res.erroValidacao, limiteDiario: res.limiteDiario,
+        }),
+      });
+    } catch {}
+  } catch (e) {
+    PACER.ultimoMotivo = "erro: " + e.message;
+  } finally {
+    PACER.rodando = false;
+  }
+}
+
+// Ciclo de verificação a cada 5 min — o gap real (10-13 min) é checado no início.
+setInterval(() => { pacerCiclo().catch(() => {}); }, 5 * 60 * 1000);
+// Primeira tentativa 90s após o boot (a conexão costuma abrir em <30s).
+setTimeout(() => { pacerCiclo().catch(() => {}); }, 90 * 1000);
 
 // v2.6.1: diagnóstico em massa — valida números e devolve o JID canônico de
 // cada um (onWhatsApp). NÃO envia nada. Uso: {phones: ["5581..."]}
