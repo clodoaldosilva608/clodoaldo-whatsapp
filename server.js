@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.7.0"; // marcador pra confirmar deploy no Render via /health — v2.7.0: plano seguro (pacer 10/dia, intervalo 10-13min, janela 9-19h BRT)
+const VERSION = "2.7.1"; // marcador pra confirmar deploy no Render via /health — v2.7.1: /send aceita document{url,filename,mimetype} (PDF contrato/recibo)
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -626,17 +626,29 @@ async function sendWhatsAppMessage(phone, text, jidOriginal, opts = {}) {
       }
     }
 
-    const enviada = await sock.sendMessage(jid, { text });
+    // v2.7.1: suporte a DOCUMENTO (PDF de contrato/recibo). Baileys baixa a URL
+    // sozinho (precisa ser pública — Supabase Storage público). `text` vira caption.
+    // Documento conta no teto FRIA (proteção anti-ban: envio proativo de negócio).
+    const outgoing = opts.document
+      ? {
+          document: { url: opts.document.url },
+          fileName: opts.document.filename || "documento.pdf",
+          mimetype: opts.document.mimetype || "application/pdf",
+          caption: (text || "").slice(0, 1000) || undefined,
+        }
+      : { text };
+
+    const enviada = await sock.sendMessage(jid, outgoing);
     // v2.7.0: incrementa o contador do tipo correto (fria x resposta)
     if (ehResposta) repliesToday.count++; else messagesToday.count++;
     // v2.5.9: registra para rastrear o ack real (servidor/entrega/leitura)
     registrarOutbound({
       id: enviada?.key?.id || "?",
       to: jid,
-      text: (text || "").slice(0, 40),
+      text: opts.document ? `[doc] ${(opts.document.filename || "documento.pdf").slice(0, 30)}` : (text || "").slice(0, 40),
       status: 1,
     });
-    console.log(`[WA] Sent to ${jid} (${ehResposta ? `reply ${repliesToday.count}/${REPLY_DAILY_LIMIT}` : `fria ${messagesToday.count}/${DAILY_LIMIT}`}) id=${enviada?.key?.id}`);
+    console.log(`[WA] Sent ${opts.document ? "doc " : ""}to ${jid} (${ehResposta ? `reply ${repliesToday.count}/${REPLY_DAILY_LIMIT}` : `fria ${messagesToday.count}/${DAILY_LIMIT}`}) id=${enviada?.key?.id}`);
     return { ok: true, id: enviada?.key?.id };
   } catch (e) {
     console.error("[WA] Send error:", e.message);
@@ -836,12 +848,21 @@ app.post("/disconnect", authMiddleware, async (req, res) => {
 });
 
 app.post("/send", authMiddleware, async (req, res) => {
-  const { phone, text, jid, resposta } = req.body;
-  if (!phone || !text) {
-    return res.status(400).json({ ok: false, error: "Missing phone or text" });
+  const { phone, text, jid, resposta, document } = req.body;
+  if (!phone || (!text && !document)) {
+    return res.status(400).json({ ok: false, error: "Missing phone or text/document" });
+  }
+  if (document && !document.url) {
+    return res.status(400).json({ ok: false, error: "document.url é obrigatório" });
   }
   // v2.7.0: resposta=true → reply do menu automático (cota separada da fria)
-  const result = await sendWhatsAppMessage(phone, text, jid, { resposta: resposta === true });
+  // v2.7.1: document{url,filename,mimetype} → envia PDF/ arquivo com caption
+  const result = await sendWhatsAppMessage(phone, text || "", jid, {
+    resposta: resposta === true,
+    document: document
+      ? { url: String(document.url), filename: document.filename, mimetype: document.mimetype }
+      : undefined,
+  });
   res.json(result);
 });
 
