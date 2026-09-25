@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.7.1"; // marcador pra confirmar deploy no Render via /health — v2.7.1: /send aceita document{url,filename,mimetype} (PDF contrato/recibo)
+const VERSION = "2.8.0"; // marcador pra confirmar deploy no Render via /health — v2.8.0: /send aceita image{url} (banner de marca do 1º contato; par imagem+texto = 1 toque na cota)
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -629,6 +629,20 @@ async function sendWhatsAppMessage(phone, text, jidOriginal, opts = {}) {
     // v2.7.1: suporte a DOCUMENTO (PDF de contrato/recibo). Baileys baixa a URL
     // sozinho (precisa ser pública — Supabase Storage público). `text` vira caption.
     // Documento conta no teto FRIA (proteção anti-ban: envio proativo de negócio).
+    // v2.8.0: BANNER DE MARCA do 1º contato (pedido do dono, 26/09). A imagem
+    // vai ANTES do texto, com legenda curta de marca (cartão de visitas), e o
+    // PAR (imagem + texto) conta como UM envio na cota — um toque por lead.
+    let capaLegenda = "";
+    if (opts.image?.url) {
+      try {
+        capaLegenda = "Clodoaldo Silva — Sites • Apps • Artes • Redes Sociais | clodoaldo.vercel.app";
+        await sock.sendMessage(jid, { image: { url: opts.image.url }, caption: capaLegenda });
+        console.log(`[WA] Banner de marca enviado antes do texto → ${jid}`);
+      } catch (e) {
+        // Imagem falhou (CDN/URL)? NÃO aborta: o texto é o essencial.
+        console.error("[WA] Banner falhou (seguindo só com texto):", e.message);
+      }
+    }
     const outgoing = opts.document
       ? {
           document: { url: opts.document.url },
@@ -848,20 +862,25 @@ app.post("/disconnect", authMiddleware, async (req, res) => {
 });
 
 app.post("/send", authMiddleware, async (req, res) => {
-  const { phone, text, jid, resposta, document } = req.body;
-  if (!phone || (!text && !document)) {
-    return res.status(400).json({ ok: false, error: "Missing phone or text/document" });
+  const { phone, text, jid, resposta, document, image } = req.body;
+  if (!phone || (!text && !document && !image)) {
+    return res.status(400).json({ ok: false, error: "Missing phone or text/document/image" });
   }
   if (document && !document.url) {
     return res.status(400).json({ ok: false, error: "document.url é obrigatório" });
   }
+  if (image && !image.url) {
+    return res.status(400).json({ ok: false, error: "image.url é obrigatório" });
+  }
   // v2.7.0: resposta=true → reply do menu automático (cota separada da fria)
   // v2.7.1: document{url,filename,mimetype} → envia PDF/ arquivo com caption
+  // v2.8.0: image{url} → banner de marca ANTES do texto (par = 1 toque na cota)
   const result = await sendWhatsAppMessage(phone, text || "", jid, {
     resposta: resposta === true,
     document: document
       ? { url: String(document.url), filename: document.filename, mimetype: document.mimetype }
       : undefined,
+    image: image ? { url: String(image.url) } : undefined,
   });
   res.json(result);
 });
@@ -935,9 +954,10 @@ async function pacerCiclo() {
       return;
     }
 
-    const { ref_id, telefone, mensagem, nome } = data.item;
-    console.log(`[PACER] Enviando para ${nome || telefone} (fria ${messagesToday.count + 1}/${DAILY_LIMIT} hoje, próxima em ~${PACER.intervaloMin}min)`);
-    const res = await sendWhatsAppMessage(telefone, mensagem);
+    const { ref_id, telefone, mensagem, nome, imagem } = data.item;
+    console.log(`[PACER] Enviando para ${nome || telefone} (fria ${messagesToday.count + 1}/${DAILY_LIMIT} hoje, próxima em ~${PACER.intervaloMin}min)${imagem ? " [com banner]" : ""}`);
+    // v2.8.0: banner de marca do 1º contato (o par imagem+texto = 1 toque na cota)
+    const res = await sendWhatsAppMessage(telefone, mensagem, null, imagem ? { image: { url: String(imagem) } } : {});
     PACER.ultimoEnvioMs = Date.now();
     PACER.intervaloMin = 10 + Math.floor(Math.random() * 4); // próximo gap: 10-13 min
     if (res.ok) PACER.enviados++;
