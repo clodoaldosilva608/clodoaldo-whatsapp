@@ -26,7 +26,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "2.8.0"; // marcador pra confirmar deploy no Render via /health — v2.8.0: /send aceita image{url} (banner de marca do 1º contato; par imagem+texto = 1 toque na cota)
+const VERSION = "2.9.0"; // marcador pra confirmar deploy no Render via /health — v2.9.0: encaminha fromMe que NÃO é envio da API (dono respondeu lead → desliga re-alerta lead quente, Task 91)
 const AUTH_DIR = path.join(process.cwd(), "auth_state");
 // Fonte única de verdade (v2.2.0): URL e chave FIXADAS no código — nunca mais
 // dependem de variável de ambiente no dashboard (elimina encaminhamento quebrado
@@ -43,6 +43,27 @@ function registrarMsg(info) {
   lastMessages.unshift(registro);
   if (lastMessages.length > 10) lastMessages.pop();
   return registro;
+}
+
+// v2.9.0 (esteira lead quente, Task 91): ids das mensagens que ESTE serviço
+// enviou via API nos últimos 10 min. O eco (fromMe) dessas NÃO é o dono
+// digitando — é o próprio robô (1º contato + banner, menu, follow-ups). Sem
+// essa marca, o site confundiria o envio da prospecção com retorno do dono
+// e desligaria os re-alertas de lead quente erradamente.
+const ownSentIds = new Map(); // id -> timestamp
+function marcarEnvioProprio(info) {
+  try {
+    const id = info?.key?.id;
+    if (!id) return;
+    ownSentIds.set(id, Date.now());
+    for (const [k, t] of ownSentIds) {
+      if (Date.now() - t > 10 * 60 * 1000) ownSentIds.delete(k);
+    }
+  } catch {}
+}
+function ehEnvioProprio(msg) {
+  const id = msg?.key?.id;
+  return id ? ownSentIds.has(id) : false;
 }
 
 // Diagnóstico (v2.5.2): histórico de eventos de conexão — responde remotamente
@@ -461,11 +482,16 @@ async function connectWhatsApp() {
           else if (msg.message.imageMessage?.caption) text = msg.message.imageMessage.caption;
 
           // Motivo de ignorar (registrado pra diagnóstico): grupo/status,
-          // mensagem do próprio número (fromMe — anti-loop), antiga (>5min,
-          // rajada ao acordar) ou sem texto (áudio/sticker/foto sem legenda).
+          // envio da PRÓPRIA API (eco — anti-loop), antiga (>5min, rajada ao
+          // acordar) ou sem texto (áudio/sticker/foto sem legenda).
           // v2.3.0: JIDs @lid (usuário REAL com privacidade ativada — comum em
           // quem clica em anúncio) NÃO são mais descartados. Só descartamos
           // grupos (@g.us), status/broadcast e canais (@newsletter).
+          // v2.9.0 (esteira lead quente, Task 91): fromMe volta a ser
+          // encaminhado — MAS só o que NÃO é envio da própria API
+          // (ehEnvioProprio). O que passa é o DONO digitando manualmente
+          // (respondeu um lead) e o site usa isso pra desligar os re-alertas
+          // de 24h. Anti-loop preservado: eco de envio da API segue fora.
           let skip = "";
           const ehGrupo = from.endsWith("@g.us");
           const ehStatus =
@@ -473,10 +499,10 @@ async function connectWhatsApp() {
             from.endsWith("@broadcast") ||
             from.endsWith("@newsletter");
           if (ehGrupo || ehStatus) skip = "grupo-ou-status";
-          else if (fromMe) skip = "fromMe-proprio-numero";
+          else if (fromMe && ehEnvioProprio(msg)) skip = "fromMe-envio-api";
           else {
             const tsMs = typeof timestamp === "number" ? timestamp * 1000 : Date.now();
-            if (Date.now() - tsMs > 5 * 60 * 1000) skip = "mensagem-antiga";
+            if (Date.now() - tsMs > 5 * 60 * 1000) skip = fromMe ? "fromMe-antiga" : "mensagem-antiga";
           }
           if (!skip && !text) skip = "sem-texto";
 
@@ -636,7 +662,8 @@ async function sendWhatsAppMessage(phone, text, jidOriginal, opts = {}) {
     if (opts.image?.url) {
       try {
         capaLegenda = "Clodoaldo Silva — Sites • Apps • Artes • Redes Sociais | clodoaldo.vercel.app";
-        await sock.sendMessage(jid, { image: { url: opts.image.url }, caption: capaLegenda });
+        const bannerEnviada = await sock.sendMessage(jid, { image: { url: opts.image.url }, caption: capaLegenda });
+        marcarEnvioProprio(bannerEnviada); // v2.9.0: eco do banner NÃO é o dono
         console.log(`[WA] Banner de marca enviado antes do texto → ${jid}`);
       } catch (e) {
         // Imagem falhou (CDN/URL)? NÃO aborta: o texto é o essencial.
@@ -653,6 +680,7 @@ async function sendWhatsAppMessage(phone, text, jidOriginal, opts = {}) {
       : { text };
 
     const enviada = await sock.sendMessage(jid, outgoing);
+    marcarEnvioProprio(enviada); // v2.9.0: eco deste envio NÃO é o dono
     // v2.7.0: incrementa o contador do tipo correto (fria x resposta)
     if (ehResposta) repliesToday.count++; else messagesToday.count++;
     // v2.5.9: registra para rastrear o ack real (servidor/entrega/leitura)
